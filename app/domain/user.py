@@ -18,16 +18,20 @@ class ExperienceLevel(str, Enum):
 
 
 class UserProfile(BaseModel):
+    # Physical data
     age: int = Field(ge=18, le=100)
     height_cm: float = Field(gt=100, lt=250)
     weight_kg: float = Field(gt=30, lt=300)
 
+    # Fitness goals
     goal: FitnessGoal
     experience: ExperienceLevel
 
+    # Training constraints
     training_days_per_week: int = Field(ge=1, le=7)
     training_duration_minutes: int = Field(ge=15, le=180)
 
-    dietary_preferences: list[str] = []
-    dietary_restrictions: list[str] = []
-    injuries_or_limitations: list[str] = []
+    # Additional constraints
+    dietary_preferences: list[str] = Field(default_factory=list)
+    dietary_restrictions: list[str] = Field(default_factory=list)
+    injuries_or_limitations: list[str] = Field(default_factory=list)

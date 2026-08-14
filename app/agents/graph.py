@@ -13,22 +13,24 @@ from langgraph.prebuilt import ToolNode
 
 from app.rag.exercises import search_exercises
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from app.domain.user import UserProfile, FitnessGoal, ExperienceLevel
+from app.domain.training import TrainingPlan
 
 # ============================================================
 # 1. STATE
 # ============================================================
 
-class AgentState(TypedDict):
-    """
-    In the state there are all the information that are shared among the nodes in the graph.
-    """
+class TrainingState(TypedDict):
+    user: UserProfile
+
     messages: Annotated[
         list[AnyMessage],
-        add_messages, # add_messages è un reducer (it says to LangGraph how to save the new messages:
-        # old messages + new messages -> updated messages.)
+        add_messages,
     ]
-
+    
+    training_plan: TrainingPlan | None # It must be in the state so that will be easier 
+    # for the validator to do its work (it will just evaluate the state).
 
 # ============================================================
 # 2. LLM
@@ -55,14 +57,40 @@ llm_with_tools = llm.bind_tools(tools)
 # 4. AGENT NODE
 # ============================================================
 
-def agent_node(state: AgentState):
-    """
-    Calls the LLM using the current conversation state.
-    """
+def agent_node(state: TrainingState):
 
-    response = llm_with_tools.invoke(
-        state["messages"]
+    user = state["user"]
+
+    system_message = SystemMessage(
+        content=f"""
+        You are the Training Agent of a fitness planning system.
+
+        - Age: {user.age}
+        - Height: {user.height_cm} cm
+        - Weight: {user.weight_kg} kg
+        - Goal: {user.goal}
+        - Experience: {user.experience}
+        - Training days per week: {user.training_days_per_week}
+        - Training duration: {user.training_duration_minutes} minutes
+        - Injuries or limitations: {user.injuries_or_limitations}
+
+        You are responsible for creating workout plans.
+        
+        You have access to tools that contain information
+        about exercises.
+        Use the available tools when you need exercise information.
+        Do not invent exercise information when it can be retrieved
+        from the knowledge base.
+        """
     )
+
+    messages = [
+        system_message,
+        *state["messages"],
+    ]
+
+    # response = llm_with_tools.invoke(messages)
+    response = llm.invoke(messages)
 
     return {
         "messages": [response]
@@ -77,12 +105,46 @@ def agent_node(state: AgentState):
 
 tool_node = ToolNode(tools) 
 
+# ============================================================
+# 6. PLANNER NODE
+# ============================================================
+
+structured_llm = llm.with_structured_output(TrainingPlan)
+
+PLANNER_SYSTEM_PROMPT = """
+    You are the training plan generator.
+
+    Your task is to create a personalized training plan
+    using the information available in the conversation.
+
+    The output must strictly follow the TrainingPlan schema.
+
+    Do not add explanations outside the structured output.
+    """
+
+def planner_node(state: TrainingState):
+    
+    planner_messages = [
+        SystemMessage(
+            content = PLANNER_SYSTEM_PROMPT
+        ),
+        *state["messages"],
+    ]
+    
+    
+    response = structured_llm.invoke(
+        planner_messages
+    )
+    
+    return {
+        "training_plan": response
+    }
 
 # ============================================================
-# 6. ROUTING LOGIC
+# 7. ROUTING LOGIC
 # ============================================================
 
-def should_continue(state: AgentState):
+def should_continue(state: TrainingState):
     """
     Decides whether the graph should execute tools
     or terminate.
@@ -93,14 +155,14 @@ def should_continue(state: AgentState):
     if last_message.tool_calls:
         return "tools"
 
-    return END
+    return "planner"
 
 
 # ============================================================
-# 7. GRAPH DEFINITION
+# 8. GRAPH DEFINITION
 # ============================================================
 
-graph_builder = StateGraph(AgentState)
+graph_builder = StateGraph(TrainingState)
 
 
 # Nodes
@@ -116,6 +178,10 @@ graph_builder.add_node(
     tool_node,
 )
 
+graph_builder.add_node(
+    "planner",
+    planner_node,
+)
 
 # Entry point
 graph_builder.set_entry_point(
@@ -129,14 +195,14 @@ graph_builder.set_entry_point(
 #   │
 #   ├── tool call → tools
 #   │
-#   └── no tool   → END
+#   └── no tool   → planner
 
 graph_builder.add_conditional_edges(
     "agent",
     should_continue,
     {
         "tools": "tools",
-        END: END,
+        "planner": "planner",
     },
 )
 
@@ -147,26 +213,32 @@ graph_builder.add_edge(
     "agent",
 )
 
+graph_builder.add_edge(
+    "planner",
+    END,
+)
 
 # ============================================================
-# 8. COMPILE GRAPH
+# 9. COMPILE GRAPH
 # ============================================================
 
 graph = graph_builder.compile()
 
 # ============================================================
-# 9. SIMPLE TEST FUNCTION
+# 10. SIMPLE TEST FUNCTION
 # ============================================================
 
-def run_graph(user_input: str):
+def run_graph(user_input: str, user: UserProfile, training_plan: TrainingPlan):
 
     result = graph.invoke(
-        {
+        {   
+            "user": user,
             "messages": [
                 HumanMessage(
                     content=user_input
                 )
-            ]
+            ],
+            "training_plan": training_plan,
         }
     )
 
@@ -174,10 +246,28 @@ def run_graph(user_input: str):
 
 
 if __name__ == "__main__":
+    user = UserProfile(
+        age=28,
+        height_cm=180,
+        weight_kg=80,
+        goal=FitnessGoal.MUSCLE_GAIN,
+        experience=ExperienceLevel.INTERMEDIATE,
+        training_days_per_week=4,
+        training_duration_minutes=60,
+        dietary_preferences=["omnivore"],
+        dietary_restrictions=[],
+        injuries_or_limitations=[],
+    )
 
+    training_plan = None
+    
     result = run_graph(
-        "Give me intermediate exercises for the chest."
-        # "Hello, how are you?"
+        # "Give me intermediate exercises for the chest.",
+        "Hello, how are you?",
+        # "Hello. I would like a chest routine for my chest day workout.",
+        user,
+        training_plan
+        
     )
 
     for message in result["messages"]:
