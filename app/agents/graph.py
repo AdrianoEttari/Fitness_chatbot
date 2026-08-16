@@ -35,6 +35,9 @@ class TrainingState(TypedDict):
     # for the validator to do its work (it will just evaluate the state).
     
     tool_iterations: int
+    
+    planner_error: str | None
+    planner_attempts: int
 
 # ============================================================
 # 2. LLM
@@ -64,34 +67,43 @@ llm_with_tools = llm.bind_tools(tools)
 
 def agent_node(state: TrainingState):
     TRAINING_SYSTEM_PROMPT = """
-    You are the Training Agent in a multi-agent fitness planning system.
+    You are the Training Research Agent.
 
-    Your role is to gather and reason about the information required
-    to create a personalized training plan.
+    Your task is to retrieve exercises from the exercise database
+    that can be used to build a personalized training plan.
 
-    You have access to tools containing exercise information.
+    IMPORTANT RULES:
 
-    Use the tools whenever you need reliable information about exercises.
+    1. When calling search_exercises, you MUST specify exactly ONE
+    muscle group.
 
-    Your output is NOT the final training plan.
+    2. Never call search_exercises with muscle_group=None.
 
-    Do NOT:
-    - generate a workout plan;
-    - list a complete workout;
-    - prescribe sets, reps or rest periods unless this information
-    is required by a tool call;
-    - provide the final answer to the user.
+    3. Never search for all muscle groups at once.
 
-    When using search_exercises:
-    - provide muscle_group only when a specific muscle group is required;
-    - if no specific muscle group is required, omit muscle_group;
-    - never use "all" as a muscle_group.
+    4. If you need exercises for different muscle groups,
+    perform separate tool calls.
 
-    When you have gathered enough information, simply indicate that
-    the information is ready for the planner.
+    For example:
 
-    The Planner Agent is responsible for generating the final
-    TrainingPlan.
+    search_exercises(
+        muscle_group="chest",
+        difficulty="intermediate"
+    )
+
+    Then, if you need exercises for the back:
+
+    search_exercises(
+        muscle_group="back",
+        difficulty="intermediate"
+    )
+
+    Do NOT do:
+
+    search_exercises(
+        muscle_group=None,
+        difficulty="intermediate"
+    )
     """
 
     messages = [
@@ -129,8 +141,10 @@ def process_tool_results(state: TrainingState):
     if not isinstance(last_message, ToolMessage):
         return {}
 
-    exercises_data = json.loads(last_message.content)
-    
+    try:
+        exercises_data = json.loads(last_message.content)
+    except:
+        breakpoint()
     new_exercises = [
         ExerciseInfo.model_validate(exercise)
         for exercise in exercises_data
@@ -140,10 +154,7 @@ def process_tool_results(state: TrainingState):
             *state["exercise_database"],
             *new_exercises
         ]
-    # print("\n===EXERCISE DATABASE===")
-    # for exercise in updated_database:
-    #     print("-", exercise)
-    # print("="*20)
+
     return {
         "exercise_database": updated_database,
         "tool_iterations": state["tool_iterations"]+1,
@@ -157,8 +168,9 @@ structured_llm = llm.with_structured_output(TrainingPlan)
 
 def planner_node(state: TrainingState):
     user = state["user"]
-    
     exercises = state["exercise_database"]
+    previous_error = state["planner_error"]
+    attempt = state["planner_attempts"] + 1
     
     PLANNER_SYSTEM_PROMPT = f"""
     You are the training plan generator.
@@ -171,6 +183,9 @@ def planner_node(state: TrainingState):
     You MUST ONLY use exercises from this list:
 
     {exercises}
+    
+    Do not use rest days! just workout days. 
+    The number of workout days must be equal to {user.training_days_per_week}.
     
     Moreover, you plan must be suited for a user with the following features:
     - Age: {user.age}
@@ -185,6 +200,12 @@ def planner_node(state: TrainingState):
     The output must strictly follow the TrainingPlan schema.
 
     Do not add explanations outside the structured output.
+    
+    Previous planner error:
+    {previous_error}
+
+    If a previous planner error is provided, correct the problem
+    described in that error.
     """
     
     planner_messages = [
@@ -194,13 +215,37 @@ def planner_node(state: TrainingState):
         *state["messages"],
     ]
     
-    response = structured_llm.invoke(
-        planner_messages
-    )
+    try:
+        response = structured_llm.invoke(
+            planner_messages
+        )
+        return {
+            "training_plan": response,
+            "planner_error": None,
+            "planner_attempts": attempt,
+            }
+    except Exception as e:
+        print("\n=== PLANNER VALIDATION ERROR ===")
+        print(e)
+        print("================================\n")
+
+        return {
+            "training_plan": None,
+            "planner_error": str(e),
+            "planner_attempts": attempt,
+        }
     
-    return {
-        "training_plan": response
-    }
+def should_retry_planner(state: TrainingState):
+    MAX_PLANNER_ATTEMPTS=3
+    
+    if state["planner_error"] is None:
+        return "end"
+    
+    if state["planner_attempts" >= MAX_PLANNER_ATTEMPTS]:
+        print("\nPlanner failed after maximum attempts.")
+        return "end"
+    
+    return "retry"
 
 # ============================================================
 # 8. ROUTING LOGIC
@@ -287,9 +332,17 @@ graph_builder.add_edge(
     "agent",
 )
 
-graph_builder.add_edge(
+# graph_builder.add_edge(
+#     "planner",
+#     END,
+# )
+graph_builder.add_conditional_edges(
     "planner",
-    END,
+    should_retry_planner,
+    {
+        "retry":"planner",
+        "end": END,
+    }
 )
 
 # ============================================================
@@ -304,7 +357,8 @@ graph = graph_builder.compile()
 
 def run_graph(user_input: str, user: UserProfile,
               training_plan: TrainingPlan, exercise_database: list,
-              tool_iterations: int):
+              tool_iterations: int, planner_error: str,
+              planner_attempts: int):
 
     result = graph.invoke(
         {   
@@ -316,7 +370,9 @@ def run_graph(user_input: str, user: UserProfile,
             ],
             "exercise_database": exercise_database,
             "training_plan": training_plan,
-            "tool_iterations":tool_iterations
+            "tool_iterations":tool_iterations,
+            "planner_error": planner_error,
+            "planner_attempts": planner_attempts
         }
     )
 
@@ -340,6 +396,8 @@ if __name__ == "__main__":
     training_plan = None
     exercise_database = []
     tool_iterations=0
+    planner_error = None
+    planner_attempts=0
     
     result = run_graph(
         # "Give me intermediate exercises for the chest.",
@@ -348,7 +406,9 @@ if __name__ == "__main__":
         user,
         training_plan,
         exercise_database,
-        tool_iterations
+        tool_iterations,
+        planner_error,
+        planner_attempts
         
     )
     print(result["training_plan"])

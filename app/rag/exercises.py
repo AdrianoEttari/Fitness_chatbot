@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from langchain_core.tools import tool
 import json
+from enum import Enum
 
 class ExerciseInfo(BaseModel):
     name: str
@@ -403,24 +404,26 @@ EXERCISES = [
     ),
 ]
 
+class MuscleGroup(str, Enum):
+    CHEST = "chest"
+    BACK = "back"
+    SHOULDERS = "shoulders"
+    BICEPS = "biceps"
+    TRICEPS = "triceps"
+    QUADRICEPS = "quadriceps"
+    HAMSTRINGS = "hamstrings"
+    GLUTES = "glutes"
+    CALVES = "calves"
+    ABS = "abs"
+
 @tool
 def search_exercises(
-    muscle_group: str | None = None, # it can be either str or None. The default value is None.
+    muscle_group: MuscleGroup, # it can be either str or None. The default value is None.
     difficulty: str | None = None,
 ) -> list[ExerciseInfo]:
     """
-    Search the exercise database.
-
-    Use muscle_group only when the user asks for exercises
-    targeting a specific muscle group.
-
-    If the user does not specify a muscle group, OMIT the
-    muscle_group argument entirely.
+    Search the exercise database for one specific muscle group.
     
-    DO NOT USE VALUS SUCH AS "all", "any", or "full body" for muscle_group.
-    JUST USE THE MUSCLE GROUPS AVAILABLE:
-    [chest, back, shoulders, biceps, triceps, quadriceps, hamstrings, glutes, calves, core]
-
     Args:
         muscle_group:
             Optional target muscle group.
