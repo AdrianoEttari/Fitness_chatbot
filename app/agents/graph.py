@@ -11,9 +11,9 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 import json
-from app.rag.exercises import search_exercises, ExerciseInfo
+from app.rag.exercises import search_exercises, ExerciseInfo, MuscleGroup, ExerciseSearchResult
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from app.domain.user import UserProfile, FitnessGoal, ExperienceLevel
 from app.domain.training import TrainingPlan
 
@@ -29,7 +29,9 @@ class TrainingState(TypedDict):
         add_messages,
     ]
     
-    exercise_database: list[ExerciseInfo]
+    exercise_search_results: list[ExerciseSearchResult]
+    
+    searched_muscle_groups: list[MuscleGroup]
     
     training_plan: TrainingPlan | None # It must be in the state so that will be easier 
     # for the validator to do its work (it will just evaluate the state).
@@ -133,7 +135,7 @@ tool_node = ToolNode(tools)
 
 def process_tool_results(state: TrainingState):
     """
-    The result of the tool, if the model picked any, is appended in the state argument "exercise_database".
+    The result of the tool, if the model picked any, is appended in the state argument "exercise_search_results".
     """
     
     last_message = state["messages"][-1]
@@ -141,22 +143,46 @@ def process_tool_results(state: TrainingState):
     if not isinstance(last_message, ToolMessage):
         return {}
 
+    # The message immediately before the ToolMessage
+    # should contain the original tool call.
+    tool_call_message = state["messages"][-2]
+
+    if not isinstance(tool_call_message, AIMessage):
+        return {}
+
+    tool_calls = tool_call_message.tool_calls
+
+    if not tool_calls:
+        return {}
+
+    tool_call = tool_calls[0] # this is good just now becasue the model is only calling a single tool at a time.
+
+    muscle_group = tool_call["args"]["muscle_group"]
+    difficulty = tool_call["args"].get("difficulty")
+    
     try:
         exercises_data = json.loads(last_message.content)
     except:
         breakpoint()
+        
     new_exercises = [
         ExerciseInfo.model_validate(exercise)
         for exercise in exercises_data
     ]
     
+    search_result = ExerciseSearchResult(
+        muscle_group=MuscleGroup(muscle_group),
+        difficulty=difficulty,
+        exercises=new_exercises
+    )
+    
     updated_database = [
-            *state["exercise_database"],
-            *new_exercises
+            *state["exercise_search_results"],
+            *search_result,
         ]
 
     return {
-        "exercise_database": updated_database,
+        "exercise_search_results": updated_database,
         "tool_iterations": state["tool_iterations"]+1,
     }
     
@@ -168,7 +194,7 @@ structured_llm = llm.with_structured_output(TrainingPlan)
 
 def planner_node(state: TrainingState):
     user = state["user"]
-    exercises = state["exercise_database"]
+    exercises = state["exercise_search_results"]
     previous_error = state["planner_error"]
     attempt = state["planner_attempts"] + 1
     
@@ -356,8 +382,8 @@ graph = graph_builder.compile()
 # ============================================================
 
 def run_graph(user_input: str, user: UserProfile,
-              training_plan: TrainingPlan, exercise_database: list,
-              tool_iterations: int, planner_error: str,
+              training_plan: TrainingPlan, exercise_search_results: list,
+              searched_muscle_groups: list, tool_iterations: int, planner_error: str,
               planner_attempts: int):
 
     result = graph.invoke(
@@ -368,7 +394,8 @@ def run_graph(user_input: str, user: UserProfile,
                     content=user_input
                 )
             ],
-            "exercise_database": exercise_database,
+            "exercise_search_results": exercise_search_results,
+            "searched_muscle_groups": searched_muscle_groups,
             "training_plan": training_plan,
             "tool_iterations":tool_iterations,
             "planner_error": planner_error,
@@ -394,7 +421,8 @@ if __name__ == "__main__":
     )
 
     training_plan = None
-    exercise_database = []
+    exercise_search_results = []
+    searched_muscle_groups = []
     tool_iterations=0
     planner_error = None
     planner_attempts=0
@@ -405,7 +433,8 @@ if __name__ == "__main__":
         # "Hello. I would like a chest routine for my chest day workout.",
         user,
         training_plan,
-        exercise_database,
+        exercise_search_results,
+        searched_muscle_groups,
         tool_iterations,
         planner_error,
         planner_attempts

@@ -416,6 +416,11 @@ class MuscleGroup(str, Enum):
     CALVES = "calves"
     ABS = "abs"
 
+class ExerciseSearchResult(BaseModel):
+    muscle_group: MuscleGroup
+    difficulty: str | None
+    exercises: list[ExerciseInfo]
+    
 @tool
 def search_exercises(
     muscle_group: MuscleGroup, # it can be either str or None. The default value is None.
