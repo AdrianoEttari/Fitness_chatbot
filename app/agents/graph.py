@@ -106,6 +106,8 @@ def agent_node(state: TrainingState):
         muscle_group=None,
         difficulty="intermediate"
     )
+    
+    5. If a tool returns an error, you MUST analyze the error and try the tool again with corrected arguments when possible. Do not simply explain the error to the user.
     """
 
     messages = [
@@ -137,50 +139,73 @@ def process_tool_results(state: TrainingState):
     """
     The result of the tool, if the model picked any, is appended in the state argument "exercise_search_results".
     """
+    # Find the AIMessage that contains the tool call
+    tool_call_message = None
     
-    last_message = state["messages"][-1]
-
-    if not isinstance(last_message, ToolMessage):
-        return {}
-
-    # The message immediately before the ToolMessage
-    # should contain the original tool call.
-    tool_call_message = state["messages"][-2]
-
-    if not isinstance(tool_call_message, AIMessage):
-        return {}
-
-    tool_calls = tool_call_message.tool_calls
-
-    if not tool_calls:
-        return {}
-
-    tool_call = tool_calls[0] # this is good just now becasue the model is only calling a single tool at a time.
-
-    muscle_group = tool_call["args"]["muscle_group"]
-    difficulty = tool_call["args"].get("difficulty")
+    for message in reversed(state["messages"]):
+        if isinstance(message, AIMessage) and message.tool_calls:
+            tool_call_message = message
+            break
     
-    try:
-        exercises_data = json.loads(last_message.content)
-    except:
-        breakpoint()
-        
-    new_exercises = [
-        ExerciseInfo.model_validate(exercise)
-        for exercise in exercises_data
+    if tool_call_message is None:
+        return {}
+    
+    # Take every id of each tool in AIMessage
+    tool_call_ids = {
+        call["id"]
+        for call in tool_call_message.tool_calls
+    }
+    
+    tool_messages = [
+        message
+        for message in state["messages"]
+        if (
+            isinstance(message, ToolMessage)
+            and message.tool_call_id in tool_call_ids
+        )    
     ]
     
-    search_result = ExerciseSearchResult(
-        muscle_group=MuscleGroup(muscle_group),
-        difficulty=difficulty,
-        exercises=new_exercises
-    )
+    new_search_results = []
     
+    for tool_message in tool_messages:
+        if tool_message.status == "error":
+            continue
+    
+        # Find the tool call corresponding to this ToolMessage
+        # next(generator, None) returns the first element of the generator that satisfies the if condition and if there are no other elements it returns None. Notice that we're looping for each tool message, so each tool_message will be taken at the end, even if tool_call considers just one of them.
+        tool_call = next(
+            (
+                call
+                for call in tool_call_message.tool_calls
+                if call["id"] == tool_message.tool_call_id
+            ),
+            None,
+        )
+
+        if tool_call is None:
+            continue
+
+        muscle_group = tool_call["args"]["muscle_group"]
+        difficulty = tool_call["args"].get("difficulty")
+
+        exercises_data = json.loads(tool_message.content)
+        
+        new_exercises = [
+            ExerciseInfo.model_validate(exercise)
+            for exercise in exercises_data
+        ]
+    
+        search_result = ExerciseSearchResult(
+            muscle_group=MuscleGroup(muscle_group),
+            difficulty=difficulty,
+            exercises=new_exercises
+        )
+        new_search_results.append(search_result)
+
     updated_database = [
             *state["exercise_search_results"],
-            *search_result,
+            *new_search_results,
         ]
-
     return {
         "exercise_search_results": updated_database,
         "tool_iterations": state["tool_iterations"]+1,
@@ -197,21 +222,29 @@ def planner_node(state: TrainingState):
     exercises = state["exercise_search_results"]
     previous_error = state["planner_error"]
     attempt = state["planner_attempts"] + 1
-    
+
     PLANNER_SYSTEM_PROMPT = f"""
     You are the training plan generator.
 
     Your task is to create a personalized training plan
     using the information available in the conversation.
-    
-    The following exercises have been retrieved from the exercise database.
 
-    You MUST ONLY use exercises from this list:
-
-    {exercises}
+    IMPORTANT RULES:
+    * The number of workout days must be equal to {user.training_days_per_week}.
+    * You MUST ONLY use exercises from this list, but you don't have to use them all: {exercises}
+    * Do not use rest days! just workout days. 
+    * The output must strictly follow the TrainingPlan schema.
     
-    Do not use rest days! just workout days. 
-    The number of workout days must be equal to {user.training_days_per_week}.
+    A workout day MAY contain exercises targeting multiple related muscle groups.
+
+    You should combine complementary muscle groups when appropriate.
+    For example:
+    - chest + triceps
+    - back + biceps
+    - shoulders + triceps
+    - quadriceps + hamstrings + glutes
+
+    Do not assume that one muscle group must correspond to exactly one workout day.
     
     Moreover, you plan must be suited for a user with the following features:
     - Age: {user.age}
@@ -222,8 +255,7 @@ def planner_node(state: TrainingState):
     - Training days per week: {user.training_days_per_week}
     - Training duration: {user.training_duration_minutes} minutes
     - Injuries or limitations: {user.injuries_or_limitations}
-    
-    The output must strictly follow the TrainingPlan schema.
+
 
     Do not add explanations outside the structured output.
     
@@ -262,12 +294,12 @@ def planner_node(state: TrainingState):
         }
     
 def should_retry_planner(state: TrainingState):
-    MAX_PLANNER_ATTEMPTS=3
+    MAX_PLANNER_ATTEMPTS=5
     
     if state["planner_error"] is None:
         return "end"
     
-    if state["planner_attempts" >= MAX_PLANNER_ATTEMPTS]:
+    if state["planner_attempts"] >= MAX_PLANNER_ATTEMPTS:
         print("\nPlanner failed after maximum attempts.")
         return "end"
     
@@ -358,10 +390,6 @@ graph_builder.add_edge(
     "agent",
 )
 
-# graph_builder.add_edge(
-#     "planner",
-#     END,
-# )
 graph_builder.add_conditional_edges(
     "planner",
     should_retry_planner,
@@ -443,9 +471,9 @@ if __name__ == "__main__":
     print(result["training_plan"])
     print(type(result["training_plan"]))
     
-    for message in result["messages"]:
-        print("\n--------------------")
-        print(type(message).__name__)
-        print(message)
+    # for message in result["messages"]:
+    #     print("\n--------------------")
+    #     print(type(message).__name__)
+    #     print(message)
     breakpoint()
     print(result)
