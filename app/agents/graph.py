@@ -223,6 +223,19 @@ def planner_node(state: TrainingState):
     previous_error = state["planner_error"]
     attempt = state["planner_attempts"] + 1
 
+    error_feedback=""
+    if previous_error is not None:
+        error_feedback = f"""
+        IMPORTANT:
+        A previous attempt to generate the training plan was rejected.
+
+        The validation error was:
+        {previous_error}
+
+        You MUST correct this error in the new plan.
+        """
+        
+
     PLANNER_SYSTEM_PROMPT = f"""
     You are the training plan generator.
 
@@ -259,11 +272,7 @@ def planner_node(state: TrainingState):
 
     Do not add explanations outside the structured output.
     
-    Previous planner error:
-    {previous_error}
-
-    If a previous planner error is provided, correct the problem
-    described in that error.
+    {error_feedback}
     """
     
     planner_messages = [
@@ -293,9 +302,57 @@ def planner_node(state: TrainingState):
             "planner_attempts": attempt,
         }
     
-def should_retry_planner(state: TrainingState):
-    MAX_PLANNER_ATTEMPTS=5
+MAX_PLANNER_ATTEMPTS=5    
     
+def should_retry_planner(state: TrainingState):
+    if state["planner_error"] is None:
+        return "validate"
+    
+    if state["planner_attempts"] >= MAX_PLANNER_ATTEMPTS:
+        print("\nPlanner failed after maximum attempts.")
+        return "validate"
+    
+    return "retry"
+
+def validate_training_plan(state: TrainingState):
+    training_plan = state["training_plan"]
+    search_results = state["exercise_search_results"]
+
+    if training_plan is None:
+        return {
+            "planner_error": "Training plan is missing."
+        }
+
+    # Collect all exercise names returned by the tools
+    available_exercises = {
+        exercise.name
+        for search_result in search_results
+        for exercise in search_result.exercises
+    }
+
+    invalid_exercises = []
+
+    for workout in training_plan.workouts:
+        for exercise in workout.exercises:
+            if exercise.name not in available_exercises:
+                invalid_exercises.append(exercise.name)
+    
+    # There is no need of writing state["planner_error"]=...
+    # The reason is that I put in the function argument state: TrainingState
+    # So, the final dictionary will be the update of the state.
+    if invalid_exercises:
+        return {
+            "planner_error": (
+                "The following exercises were not found in the "
+                f"exercise database: {invalid_exercises}"
+            )
+        }
+
+    return {
+        "planner_error": None
+    }
+
+def validation_result(state: TrainingState):
     if state["planner_error"] is None:
         return "end"
     
@@ -304,18 +361,18 @@ def should_retry_planner(state: TrainingState):
         return "end"
     
     return "retry"
-
+        
 # ============================================================
 # 8. ROUTING LOGIC
 # ============================================================
-MAX_TOOL_ITERATIONS = 5
 
 def should_continue(state: TrainingState):
     """
     Decides whether the graph should execute tools
     or terminate.
     """
-
+    MAX_TOOL_ITERATIONS = 5
+    
     last_message = state["messages"][-1]
 
     if state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
@@ -357,6 +414,11 @@ graph_builder.add_node(
     process_tool_results,
 )
 
+graph_builder.add_node(
+    "validate_training_plan",
+    validate_training_plan
+)
+
 # Entry point
 graph_builder.set_entry_point(
     "agent"
@@ -395,9 +457,19 @@ graph_builder.add_conditional_edges(
     should_retry_planner,
     {
         "retry":"planner",
-        "end": END,
+        "validate": "validate_training_plan",
     }
 )
+
+graph_builder.add_conditional_edges(
+    "validate_training_plan",
+    validation_result,
+    {
+        "retry":"planner",
+        "end": END
+    }
+)
+
 
 # ============================================================
 # 10. COMPILE GRAPH
