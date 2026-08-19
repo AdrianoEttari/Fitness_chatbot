@@ -222,58 +222,68 @@ def planner_node(state: TrainingState):
     exercises = state["exercise_search_results"]
     previous_error = state["planner_error"]
     attempt = state["planner_attempts"] + 1
+    current_plan = state["training_plan"]
+    days_per_week = user.training_days_per_week
+        
+    if previous_error is None:
+        PLANNER_SYSTEM_PROMPT = f"""
+        You are the training plan generator.
 
-    error_feedback=""
-    if previous_error is not None:
-        error_feedback = f"""
-        IMPORTANT:
-        A previous attempt to generate the training plan was rejected.
+        Your task is to create a personalized training plan
+        using the information available in the conversation.
 
-        The validation error was:
+        IMPORTANT RULES:
+        * The number of workout days must be equal to {days_per_week} for week.
+        * You MUST ONLY use exercises from this list, but you don't have to use them all: {exercises}
+        * Do not use rest days! just workout days. 
+        * The output must strictly follow the TrainingPlan schema.
+        
+        A workout day MAY contain exercises targeting multiple related muscle groups.
+
+        You should combine complementary muscle groups when appropriate.
+        For example:
+        - chest + triceps
+        - back + biceps
+        - shoulders + triceps
+        - quadriceps + hamstrings + glutes
+
+        Do not assume that one muscle group must correspond to exactly one workout day.
+        
+        Moreover, you plan must be suited for a user with the following features:
+        - Age: {user.age}
+        - Height: {user.height_cm} cm
+        - Weight: {user.weight_kg} kg
+        - Goal: {user.goal}
+        - Experience: {user.experience}
+        - Training days per week: {days_per_week}
+        - Training duration: {user.training_duration_minutes} minutes
+        - Injuries or limitations: {user.injuries_or_limitations}
+
+
+        Do not add explanations outside the structured output.
+        """
+    else:
+        PLANNER_SYSTEM_PROMPT = f"""
+        You are the training plan modifier.
+
+        You are given an existing training plan and a validation error.
+
+        Your ONLY task is to modify the existing training plan
+        so that the validation error is fixed.
+
+        Do NOT redesign the training plan.
+        Do NOT change anything that is unrelated to the error.
+        Keep all valid parts of the existing plan unchanged.
+
+        VALIDATION ERROR:
         {previous_error}
 
-        You MUST correct this error in the new plan.
+        EXISTING TRAINING PLAN:
+        {current_plan}
+
+        Return ONLY the corrected TrainingPlan.
         """
-        
-
-    PLANNER_SYSTEM_PROMPT = f"""
-    You are the training plan generator.
-
-    Your task is to create a personalized training plan
-    using the information available in the conversation.
-
-    IMPORTANT RULES:
-    * The number of workout days must be equal to {user.training_days_per_week}.
-    * You MUST ONLY use exercises from this list, but you don't have to use them all: {exercises}
-    * Do not use rest days! just workout days. 
-    * The output must strictly follow the TrainingPlan schema.
     
-    A workout day MAY contain exercises targeting multiple related muscle groups.
-
-    You should combine complementary muscle groups when appropriate.
-    For example:
-    - chest + triceps
-    - back + biceps
-    - shoulders + triceps
-    - quadriceps + hamstrings + glutes
-
-    Do not assume that one muscle group must correspond to exactly one workout day.
-    
-    Moreover, you plan must be suited for a user with the following features:
-    - Age: {user.age}
-    - Height: {user.height_cm} cm
-    - Weight: {user.weight_kg} kg
-    - Goal: {user.goal}
-    - Experience: {user.experience}
-    - Training days per week: {user.training_days_per_week}
-    - Training duration: {user.training_duration_minutes} minutes
-    - Injuries or limitations: {user.injuries_or_limitations}
-
-
-    Do not add explanations outside the structured output.
-    
-    {error_feedback}
-    """
     
     planner_messages = [
         SystemMessage(
@@ -291,14 +301,59 @@ def planner_node(state: TrainingState):
             "planner_error": None,
             "planner_attempts": attempt,
             }
-    except Exception as e:
+    except Exception as e:        
+        import re
+        import json
+
+        text = str(e)
+        # Estrae il JSON dopo "completion "
+        match = re.search(
+            r'completion (\{.*\})\. Got:',
+            text,
+            flags=re.DOTALL
+        )
+
+        if not match:
+            print("JSON non trovato nell'eccezione")
+            breakpoint()
+        else:
+            json_str = match.group(1)
+
+            data = json.loads(json_str)
+            state["training_plan"] = data
+            workouts = data.get("workouts", [])
+
+            rest_days = [workout for workout in workouts if workout["focus"].lower()=="rest"]
+                
+            print(f"days_per_week: {days_per_week}")
+            print(f"number of workouts: {len(workouts)}")
+            
+        if len(workouts) != days_per_week:
+            if len(rest_days)>0:
+                planner_error = f"""
+                The number of workout days of your plan is {len(workouts)}
+                but you MUST use just {days_per_week} workout days!
+                
+                Moreover, the following workout days have to be removed: {rest_days}.
+                DO NOT USE REST DAYS!
+                """
+            else:
+                planner_error = f"""
+                The number of workout days of your plan is {len(workouts)}
+                but you MUST use just {days_per_week} workout days!
+                """
+        else:
+            planner_error = str(e)
+            
+        # breakpoint()
+        
         print("\n=== PLANNER VALIDATION ERROR ===")
-        print(e)
+        # print(e)
         print("================================\n")
 
         return {
             "training_plan": None,
-            "planner_error": str(e),
+            "planner_error": planner_error,
             "planner_attempts": attempt,
         }
     
